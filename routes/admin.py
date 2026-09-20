@@ -2264,6 +2264,7 @@ def api_get_categories():
         traceback.print_exc()
         return jsonify({'General': {'name': 'General', 'icon': 'fa-tag', 'count': 0}})
         
+        
 @admin_bp.route('/api/categories', methods=['POST'])
 @admin_bp.route('/admin/api/categories', methods=['POST'])
 @admin_required
