@@ -1228,6 +1228,25 @@ def admin_dashboard():
         except Exception as e:
             print(f"❌ Error loading supplier data: {e}")
 
+                categories = {}
+        try:
+            cat_resp = requests.get(
+                f"{Config.SUPABASE_URL}/rest/v1/categories?select=name,icon",
+                headers=Config.SUPABASE_HEADERS,
+                timeout=10
+            )
+            if cat_resp.status_code == 200:
+                for c in cat_resp.json() or []:
+                    name = str(c.get('name', '')).strip()
+                    if name:
+                        categories[name] = {
+                            'name': name,
+                            'icon': c.get('icon') or 'fa-tag',
+                            'count': 0
+                        }
+        except Exception as e:
+            print(f"⚠️ Categories fetch failed: {e}")
+
         return render_template('admin.html',
             products=paginated_products,
             all_products=all_products,
@@ -1254,6 +1273,7 @@ def admin_dashboard():
             overdue_count=overdue_count,
             supplier_summary=supplier_summary,
             suppliers=suppliers,
+            categories=categories,
             low_stock_count=low_stock_count,
             out_of_stock_count=out_of_stock_items
         )
