@@ -16,45 +16,18 @@ from werkzeug.utils import secure_filename
 
 from config import Config
 from models.user import User
-from utils.data import get_cart, get_sales_analytics, load_bundles, load_orders, load_products, update_product_stock
+from utils.data import (
+    get_cart,
+    get_sales_analytics,
+    load_bundles,
+    load_orders,
+    load_products,
+    order_revenue_value,
+    update_product_stock,
+)
 from utils.storage import load_json_data, save_json_data
 
 admin_bp = Blueprint('admin', __name__)
-def order_revenue(order):
-    """Return product revenue only; delivery charges are not revenue."""
-    items = order.get('items', []) or []
-    if isinstance(items, str):
-        try:
-            items = json.loads(items)
-        except (TypeError, ValueError):
-            items = []
-
-    item_revenue = 0
-    has_items = False
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        try:
-            quantity = float(item.get('quantity', 1) or 1)
-            price = float(item.get('price', 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        item_revenue += price * quantity
-        has_items = True
-
-    if has_items:
-        return item_revenue
-
-    try:
-        subtotal = float(order.get('subtotal', 0) or 0)
-        discount = float(order.get('discount', 0) or 0)
-        if subtotal or discount:
-            return max(0, subtotal - discount)
-        total = float(order.get('total', order.get('total_charged', 0)) or 0)
-        shipping = float(order.get('shipping', 0) or 0)
-        return max(0, total - shipping)
-    except (TypeError, ValueError):
-        return 0
 
 # ============================================================
 # DETECT VERCEL ENVIRONMENT
@@ -509,15 +482,7 @@ def api_orders_list():
         
         all_orders = []
         if response.status_code == 200:
-            raw_orders = response.json()
-            seen_order_ids = set()
-            for order in raw_orders:
-                order_id = str(order.get('order_id') or order.get('id') or '')
-                if order_id and order_id in seen_order_ids:
-                    continue
-                if order_id:
-                    seen_order_ids.add(order_id)
-                all_orders.append(order)
+            all_orders = response.json()
             print(f"📋 Found {len(all_orders)} orders from Supabase")
         else:
             # Fallback to local cache
@@ -957,14 +922,14 @@ def admin_dashboard():
                     'total_spent': 0
                 }
             customer_dict[name]['orders'] += 1
-            customer_dict[name]['total_spent'] += order_revenue(order)
+            customer_dict[name]['total_spent'] += order.get('total', 0)
 
         customers = list(customer_dict.values())
         customers.sort(key=lambda x: x['orders'], reverse=True)
         total_customers = len(customers)
 
         total_orders = len([o for o in all_orders if o.get('status') != 'cancelled'])
-        total_revenue = sum(order_revenue(o) for o in all_orders if o.get('status') != 'cancelled')
+        total_revenue = sum(order_revenue_value(o) for o in all_orders if o.get('status') != 'cancelled')
         pending_orders = len([o for o in all_orders if o.get('status') == 'pending'])
         
         low_stock_items = 0
@@ -1003,7 +968,7 @@ def admin_dashboard():
             last_day_last_month = datetime(today.year, today.month, 1).date() - timedelta(days=1)
 
         for order in all_orders:
-            total = order_revenue(order)
+            total = order_revenue_value(order)
 
             if order.get('status') == 'cancelled':
                 continue
@@ -1228,25 +1193,6 @@ def admin_dashboard():
         except Exception as e:
             print(f"❌ Error loading supplier data: {e}")
 
-                categories = {}
-        try:
-            cat_resp = requests.get(
-                f"{Config.SUPABASE_URL}/rest/v1/categories?select=name,icon",
-                headers=Config.SUPABASE_HEADERS,
-                timeout=10
-            )
-            if cat_resp.status_code == 200:
-                for c in cat_resp.json() or []:
-                    name = str(c.get('name', '')).strip()
-                    if name:
-                        categories[name] = {
-                            'name': name,
-                            'icon': c.get('icon') or 'fa-tag',
-                            'count': 0
-                        }
-        except Exception as e:
-            print(f"⚠️ Categories fetch failed: {e}")
-
         return render_template('admin.html',
             products=paginated_products,
             all_products=all_products,
@@ -1273,7 +1219,6 @@ def admin_dashboard():
             overdue_count=overdue_count,
             supplier_summary=supplier_summary,
             suppliers=suppliers,
-            categories=categories,
             low_stock_count=low_stock_count,
             out_of_stock_count=out_of_stock_items
         )
@@ -2235,61 +2180,55 @@ def api_add_user():
 @admin_bp.route('/admin/api/categories', methods=['GET'])
 @admin_required
 def api_get_categories():
-    """Get categories from Supabase categories table + products table."""
+    """Get all categories dynamically from products, plus locally saved custom categories."""
     try:
+        local_data = load_json_data() or {}
+        stored_categories = local_data.get('categories', []) or []
+        if isinstance(stored_categories, dict):
+            stored_categories = list(stored_categories.keys())
+        elif not isinstance(stored_categories, list):
+            stored_categories = []
+
         categories = {}
+        for cat in stored_categories:
+            cat_name = str(cat).strip()
+            if cat_name:
+                categories[cat_name] = {'name': cat_name, 'count': 0}
 
-        # 1. Load manually-added categories from Supabase
-        try:
-            resp = requests.get(
-                f"{Config.SUPABASE_URL}/rest/v1/categories?select=name,icon",
-                headers=Config.SUPABASE_HEADERS,
-                timeout=10
-            )
-            if resp.status_code == 200:
-                for c in resp.json() or []:
-                    name = str(c.get('name', '')).strip()
-                    if name:
-                        categories[name] = {
-                            'name': name,
-                            'icon': c.get('icon') or 'fa-tag',
-                            'count': 0
-                        }
-        except Exception as e:
-            print(f"⚠️ Categories table fetch failed: {e}")
-
-        # 2. Count products per category
-        resp = requests.get(
+        response = requests.get(
             f"{Config.SUPABASE_URL}/rest/v1/products?select=category",
             headers=Config.SUPABASE_HEADERS,
             timeout=10
         )
-        if resp.status_code == 200:
-            for p in resp.json() or []:
+
+        if response.status_code == 200:
+            products = response.json() or []
+            for p in products:
                 cat = str(p.get('category', '') or '').strip()
                 if not cat:
                     continue
                 if cat not in categories:
-                    categories[cat] = {'name': cat, 'icon': 'fa-tag', 'count': 0}
+                    categories[cat] = {'name': cat, 'count': 0}
                 categories[cat]['count'] += 1
 
-        # 3. Fallback
         if not categories:
-            categories = {'General': {'name': 'General', 'icon': 'fa-tag', 'count': 0}}
+            categories = {
+                'General': {'name': 'General', 'count': 0}
+            }
 
         return jsonify(categories)
 
     except Exception as e:
         print(f"❌ Error loading categories: {e}")
-        traceback.print_exc()
-        return jsonify({'General': {'name': 'General', 'icon': 'fa-tag', 'count': 0}})
-        
-        
+        return jsonify({
+            'General': {'name': 'General', 'count': 0}
+        })
+
 @admin_bp.route('/api/categories', methods=['POST'])
 @admin_bp.route('/admin/api/categories', methods=['POST'])
 @admin_required
 def api_add_category():
-    """Add a new category directly to Supabase."""
+    """Add a new category and persist it locally so it appears in the category list."""
     try:
         data = request.get_json() or {}
         if not data or not data.get('name'):
@@ -2299,63 +2238,28 @@ def api_add_category():
         if not category_name:
             return jsonify({'success': False, 'message': 'Category name cannot be empty'}), 400
 
-        icon = data.get('icon', 'fa-tag')
+        local_data = load_json_data() or {}
+        stored_categories = local_data.get('categories', []) or []
+        if isinstance(stored_categories, dict):
+            stored_categories = list(stored_categories.keys())
+        elif not isinstance(stored_categories, list):
+            stored_categories = []
 
-        # Check if it already exists
-        check = requests.get(
-            f"{Config.SUPABASE_URL}/rest/v1/categories?name=eq.{category_name}&select=name",
-            headers=Config.SUPABASE_HEADERS,
-            timeout=10
-        )
-        if check.status_code == 200 and check.json():
-            return jsonify({
-                'success': False,
-                'message': f'Category "{category_name}" already exists'
-            }), 409
+        stored_categories = [str(cat).strip() for cat in stored_categories if str(cat).strip()]
+        if category_name not in stored_categories:
+            stored_categories.append(category_name)
+            stored_categories = sorted(stored_categories)
+            local_data['categories'] = stored_categories
+            save_json_data(local_data)
 
-        # Insert into Supabase
-        response = requests.post(
-            f"{Config.SUPABASE_URL}/rest/v1/categories",
-            headers=Config.SUPABASE_HEADERS,
-            json={'name': category_name, 'icon': icon},
-            timeout=10
-        )
-
-        if response.status_code in [200, 201]:
-            print(f"✅ Category '{category_name}' saved to Supabase")
-
-            # Also keep local JSON for backwards compatibility
-            try:
-                local_data = load_json_data() or {}
-                stored = local_data.get('categories', []) or []
-                if isinstance(stored, dict):
-                    stored = list(stored.keys())
-                elif not isinstance(stored, list):
-                    stored = []
-                stored = [str(c).strip() for c in stored if str(c).strip()]
-                if category_name not in stored:
-                    stored.append(category_name)
-                    local_data['categories'] = sorted(stored)
-                    save_json_data(local_data)
-            except Exception as e:
-                print(f"⚠️ Local JSON save failed (non-fatal): {e}")
-
-            return jsonify({
-                'success': True,
-                'message': f'Category "{category_name}" added',
-                'category': {'name': category_name, 'icon': icon}
-            })
-        else:
-            print(f"❌ Supabase insert failed: {response.status_code} - {response.text[:200]}")
-            return jsonify({
-                'success': False,
-                'message': f'Failed to save category: {response.status_code}',
-                'error': response.text[:300]
-            }), 500
+        return jsonify({
+            'success': True,
+            'message': f'Category "{category_name}" added',
+            'category': {'name': category_name}
+        })
 
     except Exception as e:
         print(f"❌ Error adding category: {e}")
-        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
 # ============================================================
@@ -2453,7 +2357,7 @@ def admin_api_analytics():
             continue
         pm = (order.get('payment_method') or 'cash').lower()
         payment_counts[pm] = payment_counts.get(pm, 0) + 1
-        payment_revenue[pm] = payment_revenue.get(pm, 0) + order_revenue(order)
+        payment_revenue[pm] = payment_revenue.get(pm, 0) + float(order.get('total', 0) or 0)
 
     analytics['payment_methods'] = payment_counts
     analytics['payment_methods_revenue'] = payment_revenue
@@ -2499,7 +2403,13 @@ def admin_api_revenue():
         last_month_revenue = 0
 
         for order in orders:
-            total = order_revenue(order)
+            total = order.get('total', 0)
+            if isinstance(total, str):
+                try:
+                    total = float(total.replace(',', ''))
+                except:
+                    total = 0
+            total = float(total or 0)
 
             if order.get('status') == 'cancelled':
                 continue
@@ -2552,7 +2462,7 @@ def admin_api_revenue():
         else:
             month_growth = 100.0 if month_revenue > 0 else 0
 
-        total_revenue = sum(order_revenue(order) for order in orders if order.get('status') != 'cancelled')
+        total_revenue = sum(order_revenue_value(order) for order in orders if order.get('status') != 'cancelled')
 
         return jsonify({
             "total_revenue": total_revenue,
@@ -2908,7 +2818,7 @@ def api_customers():
                     'total_spent': 0
                 }
             customer_dict[name]['orders'] += 1
-            customer_dict[name]['total_spent'] += order_revenue(order)
+            customer_dict[name]['total_spent'] += order.get('total', 0)
 
         return jsonify(list(customer_dict.values()))
 
@@ -2976,7 +2886,7 @@ def api_sales_stats():
 
                 if order_date == today:
                     status = order.get('status', '')
-                    total = order_revenue(order)
+                    total = float(order.get('total', 0))
                     order_source = order.get('source', '')
                     is_credit_order = order.get('is_credit') is True or order_source == 'credit'
 
@@ -3588,7 +3498,7 @@ def api_customers_paginated():
                     'total_spent': 0
                 }
             customer_dict[name]['orders'] += 1
-            customer_dict[name]['total_spent'] += order_revenue(order)
+            customer_dict[name]['total_spent'] += order.get('total', 0)
         
         customers = list(customer_dict.values())
         customers.sort(key=lambda x: x['orders'], reverse=True)
@@ -3769,29 +3679,6 @@ def admin_pos_place_order():
 
         order_id = data.get('order_id', f'POS-{uuid.uuid4().hex[:8].upper()}')
         items = data.get('items', [])
-
-        existing_response = requests.get(
-            f"{Config.SUPABASE_URL}/rest/v1/orders",
-            headers=Config.SUPABASE_HEADERS,
-            params={
-                'order_id': f'eq.{order_id}',
-                'select': 'order_id,total,status,source,payment_method',
-                'limit': 1,
-            },
-            timeout=10,
-        )
-        if existing_response.status_code == 200:
-            existing_orders = existing_response.json() or []
-            if existing_orders:
-                existing_order = existing_orders[0]
-                return jsonify({
-                    'success': True,
-                    'duplicate': True,
-                    'order_id': existing_order.get('order_id', order_id),
-                    'total': existing_order.get('total', data.get('total', 0)),
-                    'synced': True,
-                    'message': 'Order already saved; no duplicate created.',
-                })
         
         print(f"📦 Received order: {order_id}")
         print(f"📦 Items: {len(items)}")
@@ -3899,8 +3786,6 @@ def admin_pos_place_order():
             'total': total,
             'status': 'confirmed',
             'source': 'pos',
-            'payment_method': data.get('payment_method', 'cash'),
-            'notes': data.get('notes', ''),
             'created_at': datetime.utcnow().isoformat(),
             'customer_name': customer_name,
             'customer_email': customer_email,
@@ -3912,6 +3797,10 @@ def admin_pos_place_order():
                 'phone': customer_phone,
                 'address': customer_address,
             },
+            'user_id': str(user_id),
+            'user_name': user_name,
+            'user_role': user_role,
+            'staff_name': user_name
         }
 
         print(f"💰 Total: KSh {total}")
@@ -4236,6 +4125,8 @@ def api_analytics_filtered():
 
         # ---- 3. Normalize both into a common shape ----
         def normalize(o, is_credit=False):
+            total = float(o.get('total') or o.get('amount') or 0)
+
             if is_credit:
                 source = 'credit'
                 payment_method = 'credit'
@@ -4254,29 +4145,9 @@ def api_analytics_filtered():
             if not isinstance(items, list):
                 items = []
 
-            item_total = 0.0
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                quantity = float(item.get('quantity') or 1)
-                price = float(item.get('price') or 0)
-                item_total += float(item.get('total') or (price * quantity))
-
-            if item_total > 0:
-                sales_total = item_total
-            else:
-                subtotal = float(o.get('subtotal') or 0)
-                discount = float(o.get('discount') or 0)
-                if subtotal or discount:
-                    sales_total = max(0, subtotal - discount)
-                else:
-                    charged_total = float(o.get('total') or o.get('amount') or 0)
-                    shipping = float(o.get('shipping') or 0)
-                    sales_total = max(0, charged_total - shipping)
-
             return {
                 'order_id': order_id,
-                'total': sales_total,
+                'total': total,
                 'source': source,
                 'payment_method': payment_method,
                 'status': (o.get('status') or 'confirmed').lower(),
