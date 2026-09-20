@@ -1137,8 +1137,13 @@
                 <div>
                     <label class="form-label">Category *</label>
                     <select id="prodCategory" class="form-input" required>
-                        <option value="">Select Category</option>
-                    </select>
+        <option value="">Select Category</option>
+    {% for cat_name, cat in categories.items() %}
+        <option value="{{ cat_name }}" data-icon="{{ cat.icon }}">
+            {{ cat_name }}{% if cat.count %} ({{ cat.count }}){% endif %}
+        </option>
+    {% endfor %}
+</select>
                 </div>
                 <div>
                     <label class="form-label">Supplier</label>
